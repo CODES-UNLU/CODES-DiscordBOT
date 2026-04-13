@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -130,15 +130,13 @@ def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed
         title=config.embed_title,
         description=config.embed_description_prefix,
         color=safe_embed_color(config.embed_color_hex),
-        timestamp=datetime.now(timezone.utc),
     )
 
     if config.embed_thumbnail_url:
         # Usamos imagen en lugar de thumbnail para mostrarla debajo de los campos.
         embed.set_image(url=config.embed_thumbnail_url)
 
-    if config.embed_footer:
-        embed.set_footer(text=config.embed_footer)
+    embed.set_footer(text="Centro de Estudiantes Codes++ • Licenciatura en Sistemas")
 
     if not isinstance(events, list) or not events:
         embed.add_field(name="Eventos", value="No hay eventos proximos.", inline=False)
@@ -149,12 +147,10 @@ def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed
         description = truncate(str(event.get("description", "Sin descripcion")), 300)
         date = format_event_date(event.get("date", "-"))
 
-        value = (
-            f"{description}\n"
-            f"Fecha: {date}"
-        )
+        value = description
+        field_name = truncate(f"{idx}. {title} - {date}", 256)
 
-        embed.add_field(name=f"{idx}. {title}", value=truncate(value, 1024), inline=False)
+        embed.add_field(name=field_name, value=truncate(value, 1024), inline=False)
 
     return embed
 
