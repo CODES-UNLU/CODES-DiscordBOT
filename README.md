@@ -37,7 +37,13 @@ Variables importantes:
 - `EMBED_COLOR_HEX`: color del embed en formato `#RRGGBB`.
 - `EMBED_LOGO_URL`: logo para autor/imagen del embed.
 - `EMBED_THUMBNAIL_URL`: miniatura (por ejemplo, la de CODES).
-- `SEND_ON_START`: `true/false`. Si es `true`, postea al iniciar cuando no existe estado previo.
+
+Comportamiento de publicacion:
+
+- Al iniciar, el bot siempre borra el canal configurado y publica el estado actual del endpoint.
+- Luego, vuelve a publicar solo cuando detecta cambios en el endpoint.
+
+Si el endpoint corre en local (por ejemplo `localhost:5173`), usa `http://` y no `https://` para evitar errores SSL como `WRONG_VERSION_NUMBER`.
 
 ## Ejecutar
 

@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import discord
-from discord.ext import commands
 from dotenv import load_dotenv
 
 
@@ -112,11 +112,19 @@ def truncate(value: str, limit: int) -> str:
     return value[: limit - 1] + "…"
 
 
+def format_event_date(value: Any) -> str:
+    date_raw = str(value or "-").strip()
+    if not date_raw or date_raw == "-":
+        return "-"
+
+    try:
+        return datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return date_raw
+
+
 def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed:
     events = payload.get("events", [])
-    timezone_name = payload.get("timezone", "-")
-    today = payload.get("today", "-")
-    count = payload.get("count", len(events))
 
     embed = discord.Embed(
         title=config.embed_title,
@@ -125,19 +133,12 @@ def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed
         timestamp=datetime.now(timezone.utc),
     )
 
-    if config.embed_logo_url:
-        embed.set_author(name="CODES", icon_url=config.embed_logo_url)
-        embed.set_image(url=config.embed_logo_url)
-
     if config.embed_thumbnail_url:
-        embed.set_thumbnail(url=config.embed_thumbnail_url)
+        # Usamos imagen en lugar de thumbnail para mostrarla debajo de los campos.
+        embed.set_image(url=config.embed_thumbnail_url)
 
     if config.embed_footer:
         embed.set_footer(text=config.embed_footer)
-
-    embed.add_field(name="Zona horaria", value=str(timezone_name), inline=True)
-    embed.add_field(name="Hoy", value=str(today), inline=True)
-    embed.add_field(name="Cantidad", value=str(count), inline=True)
 
     if not isinstance(events, list) or not events:
         embed.add_field(name="Eventos", value="No hay eventos proximos.", inline=False)
@@ -146,14 +147,11 @@ def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed
     for idx, event in enumerate(events[:10], start=1):
         title = truncate(str(event.get("title", "Sin titulo")), 80)
         description = truncate(str(event.get("description", "Sin descripcion")), 300)
-        date = str(event.get("date", "-"))
-        time_value = str(event.get("time", "-"))
-        event_type = str(event.get("type", "-"))
+        date = format_event_date(event.get("date", "-"))
 
         value = (
             f"{description}\n"
-            f"Fecha: {date} | Hora: {time_value}\n"
-            f"Tipo: {event_type}"
+            f"Fecha: {date}"
         )
 
         embed.add_field(name=f"{idx}. {title}", value=truncate(value, 1024), inline=False)
@@ -173,12 +171,12 @@ async def clear_channel(channel: discord.TextChannel) -> None:
             logger.warning("No se pudo borrar mensaje %s: %s", message.id, exc)
 
 
-class CalendarWatcherBot(commands.Bot):
+class CalendarWatcherBot(discord.Client):
     def __init__(self, config: Config):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.messages = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(intents=intents)
 
         self.config = config
         self.session: aiohttp.ClientSession | None = None
@@ -201,12 +199,30 @@ class CalendarWatcherBot(commands.Bot):
     async def on_ready(self) -> None:
         logger.info("Bot conectado como %s", self.user)
 
+    def build_endpoint_url(self) -> str:
+        parts = urlsplit(self.config.endpoint_url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["limit"] = str(self.config.endpoint_limit)
+
+        hostname = (parts.hostname or "").lower()
+        is_local_host = hostname in {"localhost", "127.0.0.1", "::1"}
+        scheme = parts.scheme.lower()
+
+        # En desarrollo local, muchos servidores (ej. Vite) exponen HTTP sin TLS.
+        if is_local_host and scheme == "https":
+            logger.warning(
+                "ENDPOINT_URL usa https en host local (%s). Se fuerza http para evitar error SSL.",
+                hostname,
+            )
+            parts = parts._replace(scheme="http")
+
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
     async def fetch_calendar_payload(self) -> dict[str, Any]:
         if not self.session:
             raise RuntimeError("Sesion HTTP no inicializada")
 
-        separator = "&" if "?" in self.config.endpoint_url else "?"
-        url = f"{self.config.endpoint_url}{separator}limit={self.config.endpoint_limit}"
+        url = self.build_endpoint_url()
 
         async with self.session.get(url) as response:
             response.raise_for_status()
@@ -240,9 +256,12 @@ class CalendarWatcherBot(commands.Bot):
                 current_hash = stable_hash(payload)
 
                 has_changed = saved_hash is not None and current_hash != saved_hash
-                should_post_initial = saved_hash is None and self.config.send_on_start and first_iteration
+                should_post_initial = first_iteration
 
-                if has_changed or should_post_initial:
+                if should_post_initial:
+                    logger.info("Arranque detectado. Se limpia canal y se publica estado actual.")
+                    await self.post_update(payload)
+                elif has_changed:
                     logger.info("Cambio detectado. Se actualiza canal.")
                     await self.post_update(payload)
                 else:
