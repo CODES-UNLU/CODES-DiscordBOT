@@ -1,0 +1,10 @@
+{
+  "CHANNEL_ID": "1483658430114697279",
+  "ENDPOINT_URL": "https://www.codesunlu.tech/api/upcoming-events",
+  "ENDPOINT_LIMIT": 5,
+  "REQUEST_TIMEOUT_SECONDS": 20,
+  "POLL_INTERVAL_HOURS": 12,
+  "SEND_ON_START": false,
+  "STATE_FILE": "bot_state.json",
+  "EMBED_COLOR_HEX": "#30787b"
+}

@@ -26,17 +26,14 @@ pip install -r requirements.txt
 ## Configuracion
 
 1. Copiar `.env.example` a `.env`
-2. Completar las variables
-
-Variables importantes:
-
-- `DISCORD_TOKEN`: token del bot.
-- `CHANNEL_ID`: id del canal de texto donde se publicara.
-- `ENDPOINT_URL`: URL del endpoint GET.
-- `POLL_INTERVAL_HOURS`: cada cuantas horas consultar (default `12`).
-- `EMBED_COLOR_HEX`: color del embed en formato `#RRGGBB`.
-- `EMBED_LOGO_URL`: logo para autor/imagen del embed.
-- `EMBED_THUMBNAIL_URL`: miniatura (por ejemplo, la de CODES).
+2. Completar en el archivo `.env` el token del bot:
+   - `DISCORD_TOKEN`: token del bot.
+3. Copiar `config.example.json` a `config.json`
+4. Configurar las opciones en `config.json`. Algunas variables importantes:
+   - `CHANNEL_ID`: id del canal de texto donde se publicara.
+   - `ENDPOINT_URL`: URL del endpoint GET.
+   - `POLL_INTERVAL_HOURS`: cada cuantas horas consultar (default `12`).
+   - `EMBED_COLOR_HEX`: color del embed en formato `#RRGGBB`.
 
 Comportamiento de publicacion:
 

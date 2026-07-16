@@ -33,44 +33,40 @@ class Config:
     poll_interval_hours: float
     send_on_start: bool
     state_file: Path
-    embed_title: str
-    embed_description_prefix: str
     embed_color_hex: str
-    embed_logo_url: str
-    embed_thumbnail_url: str
-    embed_footer: str
 
 
     @staticmethod
-    def from_env() -> "Config":
+    def load() -> "Config":
         token = os.getenv("DISCORD_TOKEN", "").strip()
-        channel_raw = os.getenv("CHANNEL_ID", "").strip()
-        endpoint_url = os.getenv("ENDPOINT_URL", "").strip()
-
         if not token:
-            raise ValueError("Falta DISCORD_TOKEN en variables de entorno")
+            raise ValueError("Falta DISCORD_TOKEN en variables de entorno (o archivo .env)")
+
+        config_path = Path("config.json")
+        if not config_path.exists():
+            raise FileNotFoundError("Falta config.json. Copia config.example.json a config.json y completalo.")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        channel_raw = str(data.get("CHANNEL_ID", "")).strip()
+        endpoint_url = str(data.get("ENDPOINT_URL", "")).strip()
+
         if not channel_raw.isdigit():
-            raise ValueError("CHANNEL_ID debe ser un numero valido")
+            raise ValueError("CHANNEL_ID en config.json debe ser un numero valido")
         if not endpoint_url:
-            raise ValueError("Falta ENDPOINT_URL en variables de entorno")
+            raise ValueError("Falta ENDPOINT_URL en config.json")
 
         return Config(
             discord_token=token,
             channel_id=int(channel_raw),
             endpoint_url=endpoint_url,
-            endpoint_limit=max(1, min(int(os.getenv("ENDPOINT_LIMIT", "5")), 20)),
-            request_timeout_seconds=max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))),
-            poll_interval_hours=max(0.1, float(os.getenv("POLL_INTERVAL_HOURS", "12"))),
-            send_on_start=os.getenv("SEND_ON_START", "false").strip().lower() in {"1", "true", "yes", "si"},
-            state_file=Path(os.getenv("STATE_FILE", "bot_state.json")),
-            embed_title=os.getenv("EMBED_TITLE", "Proximos eventos de CODES").strip(),
-            embed_description_prefix=os.getenv(
-                "EMBED_DESCRIPTION_PREFIX", "Se detectaron cambios en el calendario."
-            ).strip(),
-            embed_color_hex=os.getenv("EMBED_COLOR_HEX", "#1F8B4C").strip(),
-            embed_logo_url=os.getenv("EMBED_LOGO_URL", "").strip(),
-            embed_thumbnail_url=os.getenv("EMBED_THUMBNAIL_URL", "").strip(),
-            embed_footer=os.getenv("EMBED_FOOTER", "UNLu CODES").strip(),
+            endpoint_limit=max(1, min(int(data.get("ENDPOINT_LIMIT", 5)), 20)),
+            request_timeout_seconds=max(5, int(data.get("REQUEST_TIMEOUT_SECONDS", 20))),
+            poll_interval_hours=max(0.1, float(data.get("POLL_INTERVAL_HOURS", 12.0))),
+            send_on_start=bool(data.get("SEND_ON_START", False)),
+            state_file=Path(data.get("STATE_FILE", "bot_state.json")),
+            embed_color_hex=str(data.get("EMBED_COLOR_HEX", "#1F8B4C")).strip(),
         )
 
 
@@ -125,32 +121,37 @@ def format_event_date(value: Any) -> str:
 
 def build_events_embed(config: Config, payload: dict[str, Any]) -> discord.Embed:
     events = payload.get("events", [])
+    separator = "─" * 30
 
     embed = discord.Embed(
-        title=config.embed_title,
-        description=config.embed_description_prefix,
+        title="📅  Próximos eventos universitarios y del CODES",
         color=safe_embed_color(config.embed_color_hex),
     )
 
-    if config.embed_thumbnail_url:
-        # Usamos imagen en lugar de thumbnail para mostrarla debajo de los campos.
-        embed.set_image(url=config.embed_thumbnail_url)
-
-    embed.set_footer(text="Centro de Estudiantes Codes++ • Licenciatura en Sistemas")
+    embed.set_footer(text="⎯⎯  Centro de Estudiantes Codes++  •  Licenciatura en Sistemas  ⎯⎯")
 
     if not isinstance(events, list) or not events:
-        embed.add_field(name="Eventos", value="No hay eventos proximos.", inline=False)
+        embed.description = "\n> *No hay eventos próximos.*\n"
         return embed
 
+    lines: list[str] = []
+
     for idx, event in enumerate(events[:10], start=1):
-        title = truncate(str(event.get("title", "Sin titulo")), 80)
-        description = truncate(str(event.get("description", "Sin descripcion")), 300)
+        title = truncate(str(event.get("title", "Sin título")), 80)
+        description = truncate(str(event.get("description", "")).strip(), 300)
         date = format_event_date(event.get("date", "-"))
 
-        value = description
-        field_name = truncate(f"{idx}. {title} - {date}", 256)
+        lines.append(f"### {idx}.  {title}")
 
-        embed.add_field(name=field_name, value=truncate(value, 1024), inline=False)
+        if date and date != "-":
+            lines.append(f"> 🗓️  `{date}`")
+
+        if description and description.lower() not in {"sin descripción", "sin descripcion", ""}:
+            lines.append(f"> {description}")
+
+        lines.append("")
+
+    embed.description = "\n".join(lines)
 
     return embed
 
@@ -275,6 +276,6 @@ class CalendarWatcherBot(discord.Client):
 
 
 if __name__ == "__main__":
-    cfg = Config.from_env()
+    cfg = Config.load()
     bot = CalendarWatcherBot(cfg)
     bot.run(cfg.discord_token)
