@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("codes-discord-bot")
 
-STUDENTS_FILE = Path("students.json")
+STUDENTS_FILE = Path("data/students.json")
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +134,7 @@ def load_saved_hash(state_file: Path) -> str | None:
 
 
 def save_hash(state_file: Path, new_hash: str) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps({"hash": new_hash}, ensure_ascii=True), encoding="utf-8")
 
 
@@ -196,6 +197,7 @@ def save_student(user_id: int, name: str, legajo: str) -> None:
         "legajo": legajo,
         "verified_at": datetime.now().isoformat(),
     }
+    STUDENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     STUDENTS_FILE.write_text(
         json.dumps(students, ensure_ascii=False, indent=2),
         encoding="utf-8",

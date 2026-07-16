@@ -17,6 +17,6 @@
   "REQUEST_TIMEOUT_SECONDS": 20,
   "POLL_INTERVAL_HOURS": 12,
   "SEND_ON_START": false,
-  "STATE_FILE": "bot_state.json",
+  "STATE_FILE": "data/bot_state.json",
   "EMBED_COLOR_HEX": "#30787b"
 }
