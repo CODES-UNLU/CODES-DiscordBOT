@@ -609,14 +609,79 @@ class CalendarWatcherBot(discord.Client):
         super().__init__(intents=intents)
 
         self.config = config
+        self.tree = discord.app_commands.CommandTree(self)
         self.session: aiohttp.ClientSession | None = None
         self.poll_task: asyncio.Task | None = None
         self.verify_task: asyncio.Task | None = None
+
+    def _register_commands(self) -> None:
+        @self.tree.command(name="verlegajo", description="Consulta el legajo y datos de un estudiante (solo Administradores).")
+        @discord.app_commands.describe(usuario="El miembro del servidor que querés consultar")
+        @discord.app_commands.checks.has_permissions(administrator=True)
+        async def verlegajo(interaction: discord.Interaction, usuario: discord.Member) -> None:
+            user_key = str(usuario.id)
+            students = load_students()
+
+            if user_key in students:
+                data = students[user_key]
+                name = data.get("name", "Desconocido")
+                legajo = data.get("legajo", "Desconocido")
+                verified_at_raw = data.get("verified_at", "")
+
+                formatted_date = "-"
+                if verified_at_raw:
+                    try:
+                        dt = datetime.fromisoformat(verified_at_raw)
+                        formatted_date = dt.strftime("%d/%m/%Y %H:%M")
+                    except ValueError:
+                        formatted_date = verified_at_raw
+
+                embed = discord.Embed(
+                    title="🪪  Información de Verificación",
+                    color=safe_embed_color(self.config.embed_color_hex),
+                )
+                embed.add_field(name="👤 Usuario", value=f"{usuario.mention} (`{usuario.id}`)", inline=False)
+                embed.add_field(name="📝 Nombre completo", value=f"`{name}`", inline=True)
+                embed.add_field(name="🎓 Número de legajo", value=f"`{legajo}`", inline=True)
+                embed.add_field(name="📅 Fecha de verificación", value=f"`{formatted_date}`", inline=False)
+                embed.set_footer(text="⎯⎯  Centro de Estudiantes Codes++  •  Consulta de Administrador  ⎯⎯")
+
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            else:
+                embed = discord.Embed(
+                    title="⚠️  Alumno No Verificado",
+                    description=f"El usuario {usuario.mention} no se encuentra registrado en la base de datos de verificaciones.",
+                    color=discord.Color.gold(),
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        @verlegajo.error
+        async def verlegajo_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
+            if isinstance(error, discord.app_commands.MissingPermissions):
+                await interaction.response.send_message(
+                    "❌ No tenés permisos de Administrador para usar este comando.",
+                    ephemeral=True,
+                )
+            else:
+                logger.error("Error en comando /verlegajo: %s", error)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ Ocurrió un error al procesar la solicitud.",
+                        ephemeral=True,
+                    )
 
     async def setup_hook(self) -> None:
         # Registrar vistas persistentes para que sobrevivan reinicios del bot
         self.add_view(AcceptRulesView(self.config, self))
         self.add_view(SedeSelectView(self.config))
+
+        # Registrar y sincronizar comandos slash
+        self._register_commands()
+        try:
+            await self.tree.sync()
+            logger.info("Comandos Slash sincronizados correctamente.")
+        except Exception as exc:
+            logger.exception("Error al sincronizar comandos Slash: %s", exc)
 
         timeout = aiohttp.ClientTimeout(total=self.config.request_timeout_seconds)
         self.session = aiohttp.ClientSession(timeout=timeout)
