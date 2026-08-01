@@ -12,11 +12,18 @@
     "Campana": "1484696867110522950",
     "San Fernando": "1484696954188464188"
   },
+  "SEDE_ANNOUNCEMENT_CHANNELS": {
+    "Luján": "1483911473355821277",
+    "Chivilcoy": "1483911553081151749",
+    "San Miguel": "1483911649118392422"
+  },
+  "UNLU_API_URL": "https://api-unlu-haexguf5hdbacneg.canadacentral-01.azurewebsites.net",
   "ENDPOINT_URL": "https://www.codesunlu.tech/api/upcoming-events",
   "ENDPOINT_LIMIT": 5,
   "REQUEST_TIMEOUT_SECONDS": 20,
   "POLL_INTERVAL_HOURS": 12,
   "SEND_ON_START": false,
   "STATE_FILE": "data/bot_state.json",
-  "EMBED_COLOR_HEX": "#30787b"
+  "EMBED_COLOR_HEX": "#30787b",
+  "EXAMENES_PLANES_FILE": "planes_estudio.json"
 }

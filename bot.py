@@ -4,11 +4,13 @@ import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass
-from datetime import datetime
+import random
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -38,6 +40,8 @@ class Config:
     verify_info_channel_id: int
     student_role_id: int
     sede_roles: dict[str, int]
+    sede_announcement_channels: dict[str, int]
+    unlu_api_url: str
     endpoint_url: str
     endpoint_limit: int
     request_timeout_seconds: int
@@ -45,6 +49,7 @@ class Config:
     send_on_start: bool
     state_file: Path
     embed_color_hex: str
+    examenes_planes_file: Path
 
 
     @staticmethod
@@ -83,6 +88,11 @@ class Config:
         raw_roles = data.get("SEDE_ROLES", {})
         sede_roles = {name: int(role_id) for name, role_id in raw_roles.items()}
 
+        raw_ann_channels = data.get("SEDE_ANNOUNCEMENT_CHANNELS", {})
+        sede_announcement_channels = {name: int(ch_id) for name, ch_id in raw_ann_channels.items()}
+
+        unlu_api_url = str(data.get("UNLU_API_URL", "")).strip().rstrip("/")
+
         return Config(
             discord_token=token,
             channel_id=int(channel_raw),
@@ -91,6 +101,8 @@ class Config:
             verify_info_channel_id=int(verify_info_raw),
             student_role_id=int(student_role_raw),
             sede_roles=sede_roles,
+            sede_announcement_channels=sede_announcement_channels,
+            unlu_api_url=unlu_api_url,
             endpoint_url=endpoint_url,
             endpoint_limit=max(1, min(int(data.get("ENDPOINT_LIMIT", 5)), 20)),
             request_timeout_seconds=max(5, int(data.get("REQUEST_TIMEOUT_SECONDS", 20))),
@@ -98,7 +110,25 @@ class Config:
             send_on_start=bool(data.get("SEND_ON_START", False)),
             state_file=Path(data.get("STATE_FILE", "bot_state.json")),
             embed_color_hex=str(data.get("EMBED_COLOR_HEX", "#1F8B4C")).strip(),
+            examenes_planes_file=Path(data.get("EXAMENES_PLANES_FILE", "planes_estudio.json")),
         )
+
+
+# ---------------------------------------------------------------------------
+# Constants: Exam sede mapping
+# ---------------------------------------------------------------------------
+
+# Maps API centroRegional values to config sede names.
+# None means the exam is available for all sedes (distance / virtual).
+SEDE_MAPPING: dict[str, str | None] = {
+    "SEDE LUJAN": "Luján",
+    "C.R. CHIVILCOY": "Chivilcoy",
+    "C.R. SAN MIGUEL": "San Miguel",
+    "A DISTANCIA": None,
+    "AULA VIRTUAL": None,
+}
+
+ART_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +204,263 @@ def fit_nickname(full_name: str, limit: int = 32) -> str:
             return short
 
     return name[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Planes de estudio / Exámenes helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExamDate:
+    """A single exam date entry from the API."""
+    materia_codigo: str
+    materia_nombre: str
+    fecha: str            # dd-mm-yyyy
+    horario: str
+    centro_regional: str
+    fecha_limite: str     # yyyy-mm-dd
+    plan_tags: list[str]  # e.g. ["17.14", "17.13"]
+    is_virtual: bool      # True for A DISTANCIA / AULA VIRTUAL
+
+
+def load_planes_codigos(planes_file: Path) -> dict[str, list[str]]:
+    """Load planes_estudio.json and return {codigo: [plan_ids]} for all subjects with a code.
+
+    Returns a dict mapping subject code to the list of plans it belongs to.
+    """
+    if not planes_file.exists():
+        logger.warning("No se encontró %s. No se consultarán exámenes.", planes_file)
+        return {}
+
+    try:
+        data = json.loads(planes_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Error al leer %s: %s", planes_file, exc)
+        return {}
+
+    codigos: dict[str, list[str]] = {}
+    for plan in data.get("planes", []):
+        plan_id = plan.get("plan", "?")
+        for materia in plan.get("materias", []):
+            codigo = materia.get("codigo")
+            if codigo is not None:
+                codigos.setdefault(codigo, [])
+                if plan_id not in codigos[codigo]:
+                    codigos[codigo].append(plan_id)
+
+    logger.info("Cargados %d códigos de materia desde %s", len(codigos), planes_file)
+    return codigos
+
+
+async def fetch_examenes_for_codigo(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    codigo: str,
+    plan_tags: list[str],
+) -> list[ExamDate]:
+    """Fetch exam dates for a single subject code from the UNLu API."""
+    url = f"{base_url}/api/examenes-finales/{codigo}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                logger.warning("API respondió %d para código %s", resp.status, codigo)
+                return []
+            data = await resp.json()
+    except Exception as exc:
+        logger.warning("Error consultando exámenes para %s: %s", codigo, exc)
+        return []
+
+    if not data.get("exitoso"):
+        return []
+
+    nombre_materia = str(data.get("nombreMateria", codigo)).strip()
+    results: list[ExamDate] = []
+
+    for f in data.get("fechas", []):
+        centro = str(f.get("centroRegional", "")).strip().upper()
+        is_virtual = SEDE_MAPPING.get(centro) is None and centro in {"A DISTANCIA", "AULA VIRTUAL"}
+        results.append(ExamDate(
+            materia_codigo=codigo,
+            materia_nombre=nombre_materia,
+            fecha=str(f.get("fecha", "")),
+            horario=str(f.get("horario", "")),
+            centro_regional=centro,
+            fecha_limite=str(f.get("fechaLimite", "")),
+            plan_tags=plan_tags,
+            is_virtual=is_virtual,
+        ))
+
+    return results
+
+
+def parse_exam_fecha(fecha_str: str) -> datetime | None:
+    """Parse dd-mm-yyyy exam date."""
+    try:
+        return datetime.strptime(fecha_str, "%d-%m-%Y")
+    except ValueError:
+        return None
+
+
+def parse_fecha_limite(fl_str: str) -> datetime | None:
+    """Parse yyyy-mm-dd deadline."""
+    try:
+        return datetime.strptime(fl_str, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def classify_exams_by_sede(
+    all_exams: list[ExamDate],
+    sede_names: list[str],
+) -> dict[str, dict[str, list[ExamDate]]]:
+    """Group exams by sede and classify into 'abierta' / 'proxima'.
+
+    Returns: {sede_name: {"abierta": [...], "proxima": [...]}}
+
+    - abierta: inscription deadline hasn't passed yet (fechaLimite >= today)
+    - proxima: inscription closed but exam date hasn't passed (fecha >= today)
+    - past exams (fecha < today) are filtered out
+    """
+    today = datetime.now(ART_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_naive = today.replace(tzinfo=None)
+
+    grouped: dict[str, dict[str, list[ExamDate]]] = {
+        sede: {"abierta": [], "proxima": []} for sede in sede_names
+    }
+
+    for exam in all_exams:
+        exam_date = parse_exam_fecha(exam.fecha)
+        deadline = parse_fecha_limite(exam.fecha_limite)
+
+        # Skip past exams
+        if exam_date is not None and exam_date < today_naive:
+            continue
+
+        # Determine status
+        if deadline is not None and deadline >= today_naive:
+            status = "abierta"
+        else:
+            status = "proxima"
+
+        # Determine which sedes get this exam
+        mapped_sede = SEDE_MAPPING.get(exam.centro_regional)
+
+        if mapped_sede is not None and mapped_sede in grouped:
+            # Specific sede exam
+            grouped[mapped_sede][status].append(exam)
+        elif exam.is_virtual:
+            # Virtual / distance → goes to all sedes
+            for sede in sede_names:
+                grouped[sede][status].append(exam)
+        else:
+            # Unknown centro_regional — log and skip
+            logger.debug("Centro regional desconocido: '%s'", exam.centro_regional)
+
+    # Sort each list by exam date
+    for sede in grouped:
+        for status in ("abierta", "proxima"):
+            grouped[sede][status].sort(
+                key=lambda e: parse_exam_fecha(e.fecha) or datetime.max
+            )
+
+    return grouped
+
+
+def _format_plan_badge(plan_tags: list[str]) -> str:
+    """Format plan tags as a compact badge string."""
+    if len(plan_tags) == 1:
+        return f"[Plan {plan_tags[0]}]"
+    return "[Ambos planes]"
+
+
+def build_examenes_embeds(
+    config: "Config",
+    sede_name: str,
+    exams_by_status: dict[str, list[ExamDate]],
+) -> list[discord.Embed]:
+    """Build paginated embeds for a sede's exam dates.
+
+    Discord embeds have a 6000 char total limit.  We paginate if needed.
+    """
+    now_str = datetime.now(ART_TZ).strftime("%d/%m/%Y %H:%M")
+    color = safe_embed_color(config.embed_color_hex)
+    footer_text = f"⎯⎯  Centro de Estudiantes Codes++  •  Actualizado: {now_str}  ⎯⎯"
+
+    abierta = exams_by_status.get("abierta", [])
+    proxima = exams_by_status.get("proxima", [])
+
+    if not abierta and not proxima:
+        embed = discord.Embed(
+            title=f"📋  Fechas de Finales — {sede_name}",
+            description="\n> *No hay fechas de exámenes finales vigentes.*\n",
+            color=color,
+        )
+        embed.set_footer(text=footer_text)
+        return [embed]
+
+    # Build content lines for both sections
+    sections: list[str] = []
+
+    if abierta:
+        sections.append("## 🟢  Inscripción abierta\n")
+        for exam in abierta:
+            icon = "🌐 " if exam.is_virtual else ""
+            plan_badge = _format_plan_badge(exam.plan_tags)
+            dl = parse_fecha_limite(exam.fecha_limite)
+            dl_str = dl.strftime("%d/%m/%Y") if dl else exam.fecha_limite
+            sections.append(
+                f"> {icon}**{exam.materia_nombre}** {plan_badge}\n"
+                f"> 📅 `{exam.fecha}` a las `{exam.horario}` — "
+                f"Inscripción hasta `{dl_str}`\n"
+                f"> 📍 _{exam.centro_regional}_\n"
+            )
+
+    if proxima:
+        sections.append("## 🟡  Próximamente (inscripción cerrada)\n")
+        for exam in proxima:
+            icon = "🌐 " if exam.is_virtual else ""
+            plan_badge = _format_plan_badge(exam.plan_tags)
+            sections.append(
+                f"> {icon}**{exam.materia_nombre}** {plan_badge}\n"
+                f"> 📅 `{exam.fecha}` a las `{exam.horario}`\n"
+                f"> 📍 _{exam.centro_regional}_\n"
+            )
+
+    # Paginate: Discord embeds have a 4096 description limit
+    MAX_DESC = 3900  # leave some margin
+    pages: list[str] = []
+    current_page: list[str] = []
+    current_len = 0
+
+    for section in sections:
+        if current_len + len(section) > MAX_DESC and current_page:
+            pages.append("\n".join(current_page))
+            current_page = []
+            current_len = 0
+        current_page.append(section)
+        current_len += len(section)
+
+    if current_page:
+        pages.append("\n".join(current_page))
+
+    embeds: list[discord.Embed] = []
+    total_pages = len(pages)
+
+    for i, page_content in enumerate(pages):
+        title = f"📋  Fechas de Finales — {sede_name}"
+        if total_pages > 1:
+            title += f" ({i + 1}/{total_pages})"
+
+        embed = discord.Embed(
+            title=title,
+            description=page_content,
+            color=color,
+        )
+        if i == total_pages - 1:
+            embed.set_footer(text=footer_text)
+        embeds.append(embed)
+
+    return embeds
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +900,7 @@ class CalendarWatcherBot(discord.Client):
         self.session: aiohttp.ClientSession | None = None
         self.poll_task: asyncio.Task | None = None
         self.verify_task: asyncio.Task | None = None
+        self.examenes_task: asyncio.Task | None = None
 
     def _register_commands(self) -> None:
         @self.tree.command(name="verlegajo", description="Consulta el legajo y datos de un estudiante (solo Administradores).")
@@ -670,6 +958,39 @@ class CalendarWatcherBot(discord.Client):
                         ephemeral=True,
                     )
 
+        @self.tree.command(name="testexamenes", description="Ejecuta manualmente la actualización de fechas de exámenes finales (solo Administradores).")
+        @discord.app_commands.checks.has_permissions(administrator=True)
+        async def testexamenes(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            try:
+                await self.post_examenes_update()
+                await interaction.followup.send(
+                    "✅ Actualización de exámenes finales ejecutada correctamente. "
+                    "Revisá los canales de anuncios por sede.",
+                    ephemeral=True,
+                )
+            except Exception as exc:
+                logger.exception("Error en /testexamenes: %s", exc)
+                await interaction.followup.send(
+                    f"❌ Error al ejecutar la actualización: {exc}",
+                    ephemeral=True,
+                )
+
+        @testexamenes.error
+        async def testexamenes_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
+            if isinstance(error, discord.app_commands.MissingPermissions):
+                await interaction.response.send_message(
+                    "❌ No tenés permisos de Administrador para usar este comando.",
+                    ephemeral=True,
+                )
+            else:
+                logger.error("Error en comando /testexamenes: %s", error)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ Ocurrió un error al procesar la solicitud.",
+                        ephemeral=True,
+                    )
+
     async def setup_hook(self) -> None:
         # Registrar vistas persistentes para que sobrevivan reinicios del bot
         self.add_view(AcceptRulesView(self.config, self))
@@ -687,9 +1008,10 @@ class CalendarWatcherBot(discord.Client):
         self.session = aiohttp.ClientSession(timeout=timeout)
         self.poll_task = asyncio.create_task(self.poll_loop())
         self.verify_task = asyncio.create_task(self.verify_members_loop())
+        self.examenes_task = asyncio.create_task(self.examenes_loop())
 
     async def close(self) -> None:
-        for task in (self.poll_task, self.verify_task):
+        for task in (self.poll_task, self.verify_task, self.examenes_task):
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -940,6 +1262,133 @@ class CalendarWatcherBot(discord.Client):
                             logger.warning("No se pudo quitar rol sede a %s: %s", member, exc)
 
             logger.info("Verificación de miembros completada para server '%s'", guild.name)
+
+    # -- Exámenes finales loop --
+
+    @staticmethod
+    def _seconds_until_next_monday_7am() -> float:
+        """Calculate seconds until the next Monday at 07:00 ART."""
+        now = datetime.now(ART_TZ)
+        # Find next Monday (weekday 0)
+        days_ahead = (0 - now.weekday()) % 7  # 0 = Monday
+        if days_ahead == 0:
+            # If it's already Monday, check if 7 AM has passed
+            target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+            if now >= target:
+                days_ahead = 7  # Next Monday
+        else:
+            target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=7, minute=0, second=0, microsecond=0
+        )
+        delta = (target - now).total_seconds()
+        return max(0, delta)
+
+    async def examenes_loop(self) -> None:
+        """Weekly loop: every Monday at 07:00 ART, fetch and post exam dates per sede."""
+        await self.wait_until_ready()
+
+        while not self.is_closed():
+            # Wait until next Monday 7:00 AM ART
+            wait_seconds = self._seconds_until_next_monday_7am()
+            logger.info(
+                "Exámenes: próxima ejecución en %.1f horas (lunes 07:00 ART).",
+                wait_seconds / 3600,
+            )
+            await asyncio.sleep(wait_seconds)
+
+            try:
+                await self.post_examenes_update()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Error durante el polling de exámenes: %s", exc)
+
+            # Sleep at least 1 hour to avoid double-firing on the same Monday
+            await asyncio.sleep(3600)
+
+    async def post_examenes_update(self) -> None:
+        """Fetch exam dates for all subjects and send embeds to sede channels."""
+        if not self.session:
+            logger.error("Sesión HTTP no inicializada para exámenes.")
+            return
+
+        if not self.config.unlu_api_url:
+            logger.warning("UNLU_API_URL no configurada. Se omite consulta de exámenes.")
+            return
+
+        if not self.config.sede_announcement_channels:
+            logger.warning("No hay canales de anuncios configurados. Se omite.")
+            return
+
+        # Load subject codes from planes_estudio.json
+        codigos = load_planes_codigos(self.config.examenes_planes_file)
+        if not codigos:
+            logger.warning("No se cargaron códigos de materia. Se omite.")
+            return
+
+        # Fetch exam dates for all subjects (sequential with delay)
+        logger.info("Consultando exámenes para %d materias...", len(codigos))
+        all_exams: list[ExamDate] = []
+
+        for i, (codigo, plans) in enumerate(codigos.items()):
+            try:
+                results = await fetch_examenes_for_codigo(
+                    self.session, self.config.unlu_api_url, codigo, plans
+                )
+                all_exams.extend(results)
+            except Exception as exc:
+                logger.warning("Error en fetch de examen %s: %s", codigo, exc)
+
+            # Delay between requests (skip after the last one)
+            if i < len(codigos) - 1:
+                delay = random.uniform(15, 30)
+                logger.debug("Esperando %.1fs antes de la siguiente consulta...", delay)
+                await asyncio.sleep(delay)
+
+        logger.info("Total de fechas obtenidas: %d", len(all_exams))
+
+        # Classify by sede
+        sede_names = list(self.config.sede_announcement_channels.keys())
+        grouped = classify_exams_by_sede(all_exams, sede_names)
+
+        # Send embeds to each sede channel
+        for sede_name, channel_id in self.config.sede_announcement_channels.items():
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(channel_id)
+                except discord.HTTPException:
+                    logger.error("No se pudo acceder al canal de anuncios de %s.", sede_name)
+                    continue
+
+            if not isinstance(channel, discord.TextChannel):
+                logger.error("Canal de anuncios de %s no es un canal de texto.", sede_name)
+                continue
+
+            # Clear previous bot messages in the channel
+            async for msg in channel.history(limit=50):
+                if msg.author == self.user:
+                    try:
+                        await msg.delete()
+                    except discord.HTTPException:
+                        pass
+
+            # Build and send embeds
+            exams_data = grouped.get(sede_name, {"abierta": [], "proxima": []})
+            embeds = build_examenes_embeds(self.config, sede_name, exams_data)
+
+            for embed in embeds:
+                await channel.send(embed=embed)
+
+            total = len(exams_data.get("abierta", [])) + len(exams_data.get("proxima", []))
+            logger.info(
+                "Enviados %d embed(s) con %d fecha(s) al canal de %s.",
+                len(embeds), total, sede_name,
+            )
+
+        logger.info("Actualización semanal de exámenes completada.")
 
     # -- Polling loop --
 

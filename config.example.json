@@ -7,11 +7,16 @@
   "SEDE_ROLES": {
     "Nombre Sede": "role_id"
   },
+  "SEDE_ANNOUNCEMENT_CHANNELS": {
+    "Nombre Sede": "channel_id"
+  },
+  "UNLU_API_URL": "https://your-unlu-api-url.example.com",
   "ENDPOINT_URL": "https://www.codesunlu.tech/api/upcoming-events",
   "ENDPOINT_LIMIT": 5,
   "REQUEST_TIMEOUT_SECONDS": 20,
   "POLL_INTERVAL_HOURS": 12,
   "SEND_ON_START": false,
   "STATE_FILE": "bot_state.json",
-  "EMBED_COLOR_HEX": "#1F8B4C"
+  "EMBED_COLOR_HEX": "#1F8B4C",
+  "EXAMENES_PLANES_FILE": "planes_estudio.json"
 }
