@@ -260,26 +260,34 @@ async def fetch_examenes_for_codigo(
 ) -> list[ExamDate]:
     """Fetch exam dates for a single subject code from the UNLu API."""
     url = f"{base_url}/api/examenes-finales/{codigo}"
+    logger.debug("[Exámenes] Consultando API: %s", url)
     try:
         async with session.get(url) as resp:
+            logger.debug("[Exámenes] Respuesta HTTP %d para código %s", resp.status, codigo)
             if resp.status != 200:
-                logger.warning("API respondió %d para código %s", resp.status, codigo)
+                logger.warning("[Exámenes] API respondió %d para código %s", resp.status, codigo)
                 return []
             data = await resp.json()
     except Exception as exc:
-        logger.warning("Error consultando exámenes para %s: %s", codigo, exc)
+        logger.warning("[Exámenes] Error consultando exámenes para %s: %s", codigo, exc)
         return []
 
     if not data.get("exitoso"):
+        logger.info("[Exámenes] API respondió exitoso=false para código %s. Respuesta: %s", codigo, data)
         return []
 
     nombre_materia = str(data.get("nombreMateria", codigo)).strip()
+    fechas_raw = data.get("fechas", [])
+    logger.info(
+        "[Exámenes] Código %s (%s): %d fecha(s) obtenidas de la API.",
+        codigo, nombre_materia, len(fechas_raw),
+    )
     results: list[ExamDate] = []
 
-    for f in data.get("fechas", []):
+    for f in fechas_raw:
         centro = str(f.get("centroRegional", "")).strip().upper()
         is_virtual = SEDE_MAPPING.get(centro) is None and centro in {"A DISTANCIA", "AULA VIRTUAL"}
-        results.append(ExamDate(
+        exam = ExamDate(
             materia_codigo=codigo,
             materia_nombre=nombre_materia,
             fecha=str(f.get("fecha", "")),
@@ -288,7 +296,12 @@ async def fetch_examenes_for_codigo(
             fecha_limite=str(f.get("fechaLimite", "")),
             plan_tags=plan_tags,
             is_virtual=is_virtual,
-        ))
+        )
+        logger.debug(
+            "[Exámenes]   -> %s | fecha=%s | horario=%s | centro=%s | virtual=%s | límite=%s",
+            nombre_materia, exam.fecha, exam.horario, centro, is_virtual, exam.fecha_limite,
+        )
+        results.append(exam)
 
     return results
 
@@ -323,10 +336,17 @@ def classify_exams_by_sede(
     """
     today = datetime.now(ART_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     today_naive = today.replace(tzinfo=None)
+    logger.info(
+        "[Exámenes] Clasificando %d exámenes para sedes: %s (fecha de hoy: %s)",
+        len(all_exams), sede_names, today_naive.strftime("%d/%m/%Y"),
+    )
 
     grouped: dict[str, dict[str, list[ExamDate]]] = {
         sede: {"abierta": [], "proxima": []} for sede in sede_names
     }
+
+    skipped_past = 0
+    skipped_unknown = 0
 
     for exam in all_exams:
         exam_date = parse_exam_fecha(exam.fecha)
@@ -334,6 +354,11 @@ def classify_exams_by_sede(
 
         # Skip past exams
         if exam_date is not None and exam_date < today_naive:
+            skipped_past += 1
+            logger.debug(
+                "[Exámenes] Examen pasado (filtrado): %s — fecha=%s",
+                exam.materia_nombre, exam.fecha,
+            )
             continue
 
         # Determine status
@@ -348,13 +373,25 @@ def classify_exams_by_sede(
         if mapped_sede is not None and mapped_sede in grouped:
             # Specific sede exam
             grouped[mapped_sede][status].append(exam)
+            logger.debug(
+                "[Exámenes] %s -> sede=%s, status=%s",
+                exam.materia_nombre, mapped_sede, status,
+            )
         elif exam.is_virtual:
             # Virtual / distance → goes to all sedes
             for sede in sede_names:
                 grouped[sede][status].append(exam)
+            logger.debug(
+                "[Exámenes] %s -> TODAS las sedes (virtual), status=%s",
+                exam.materia_nombre, status,
+            )
         else:
             # Unknown centro_regional — log and skip
-            logger.debug("Centro regional desconocido: '%s'", exam.centro_regional)
+            skipped_unknown += 1
+            logger.warning(
+                "[Exámenes] Centro regional desconocido (descartado): '%s' para materia %s",
+                exam.centro_regional, exam.materia_nombre,
+            )
 
     # Sort each list by exam date
     for sede in grouped:
@@ -362,6 +399,19 @@ def classify_exams_by_sede(
             grouped[sede][status].sort(
                 key=lambda e: parse_exam_fecha(e.fecha) or datetime.max
             )
+
+    # Log resumen por sede
+    logger.info(
+        "[Exámenes] Clasificación completada. Exámenes pasados descartados: %d. Centro regional desconocido: %d.",
+        skipped_past, skipped_unknown,
+    )
+    for sede in sede_names:
+        abierta_count = len(grouped[sede]["abierta"])
+        proxima_count = len(grouped[sede]["proxima"])
+        logger.info(
+            "[Exámenes]   Sede %s: %d abierta(s), %d próxima(s)",
+            sede, abierta_count, proxima_count,
+        )
 
     return grouped
 
@@ -389,7 +439,13 @@ def build_examenes_embeds(
     abierta = exams_by_status.get("abierta", [])
     proxima = exams_by_status.get("proxima", [])
 
+    logger.info(
+        "[Exámenes] Construyendo embeds para sede '%s': %d abierta(s), %d próxima(s).",
+        sede_name, len(abierta), len(proxima),
+    )
+
     if not abierta and not proxima:
+        logger.info("[Exámenes] Sin exámenes vigentes para sede '%s'. Se genera embed vacío.", sede_name)
         embed = discord.Embed(
             title=f"📋  Fechas de Finales — {sede_name}",
             description="\n> *No hay fechas de exámenes finales vigentes.*\n",
@@ -445,6 +501,7 @@ def build_examenes_embeds(
 
     embeds: list[discord.Embed] = []
     total_pages = len(pages)
+    logger.info("[Exámenes] Sede '%s': %d página(s) de embed generadas.", sede_name, total_pages)
 
     for i, page_content in enumerate(pages):
         title = f"📋  Fechas de Finales — {sede_name}"
@@ -1310,85 +1367,110 @@ class CalendarWatcherBot(discord.Client):
 
     async def post_examenes_update(self) -> None:
         """Fetch exam dates for all subjects and send embeds to sede channels."""
+        logger.info("[Exámenes] === INICIO de post_examenes_update ===")
+
         if not self.session:
-            logger.error("Sesión HTTP no inicializada para exámenes.")
+            logger.error("[Exámenes] Sesión HTTP no inicializada. Abortando.")
             return
 
         if not self.config.unlu_api_url:
-            logger.warning("UNLU_API_URL no configurada. Se omite consulta de exámenes.")
+            logger.warning("[Exámenes] UNLU_API_URL no configurada. Abortando.")
             return
 
         if not self.config.sede_announcement_channels:
-            logger.warning("No hay canales de anuncios configurados. Se omite.")
+            logger.warning("[Exámenes] No hay canales de anuncios configurados (SEDE_ANNOUNCEMENT_CHANNELS vacío). Abortando.")
             return
+
+        logger.info(
+            "[Exámenes] Config: UNLU_API_URL=%s | Canales de anuncio: %s",
+            self.config.unlu_api_url,
+            {k: v for k, v in self.config.sede_announcement_channels.items()},
+        )
 
         # Load subject codes from planes_estudio.json
         codigos = load_planes_codigos(self.config.examenes_planes_file)
         if not codigos:
-            logger.warning("No se cargaron códigos de materia. Se omite.")
+            logger.warning("[Exámenes] No se cargaron códigos de materia desde %s. Abortando.", self.config.examenes_planes_file)
             return
 
         # Fetch exam dates for all subjects (sequential with delay)
-        logger.info("Consultando exámenes para %d materias...", len(codigos))
+        logger.info("[Exámenes] Consultando exámenes para %d materias...", len(codigos))
         all_exams: list[ExamDate] = []
 
         for i, (codigo, plans) in enumerate(codigos.items()):
+            logger.info("[Exámenes] [%d/%d] Consultando código %s (planes: %s)...", i + 1, len(codigos), codigo, plans)
             try:
                 results = await fetch_examenes_for_codigo(
                     self.session, self.config.unlu_api_url, codigo, plans
                 )
+                logger.info("[Exámenes] [%d/%d] Código %s: %d resultado(s)", i + 1, len(codigos), codigo, len(results))
                 all_exams.extend(results)
             except Exception as exc:
-                logger.warning("Error en fetch de examen %s: %s", codigo, exc)
+                logger.warning("[Exámenes] Error en fetch de examen %s: %s", codigo, exc)
 
             # Delay between requests (skip after the last one)
             if i < len(codigos) - 1:
                 delay = random.uniform(15, 30)
-                logger.debug("Esperando %.1fs antes de la siguiente consulta...", delay)
+                logger.debug("[Exámenes] Esperando %.1fs antes de la siguiente consulta...", delay)
                 await asyncio.sleep(delay)
 
-        logger.info("Total de fechas obtenidas: %d", len(all_exams))
+        logger.info("[Exámenes] === Recopilación finalizada: %d fechas totales ===", len(all_exams))
 
         # Classify by sede
         sede_names = list(self.config.sede_announcement_channels.keys())
+        logger.info("[Exámenes] Clasificando exámenes por sede: %s", sede_names)
         grouped = classify_exams_by_sede(all_exams, sede_names)
 
         # Send embeds to each sede channel
+        logger.info("[Exámenes] === Enviando embeds a los canales ===")
         for sede_name, channel_id in self.config.sede_announcement_channels.items():
+            logger.info("[Exámenes] Procesando sede '%s' (canal ID: %d)...", sede_name, channel_id)
+
             channel = self.get_channel(channel_id)
             if channel is None:
+                logger.info("[Exámenes] Canal %d no encontrado en caché, intentando fetch...", channel_id)
                 try:
                     channel = await self.fetch_channel(channel_id)
-                except discord.HTTPException:
-                    logger.error("No se pudo acceder al canal de anuncios de %s.", sede_name)
+                except discord.HTTPException as exc:
+                    logger.error("[Exámenes] No se pudo acceder al canal de anuncios de %s (ID: %d): %s", sede_name, channel_id, exc)
                     continue
 
             if not isinstance(channel, discord.TextChannel):
-                logger.error("Canal de anuncios de %s no es un canal de texto.", sede_name)
+                logger.error("[Exámenes] Canal de %s (ID: %d) no es TextChannel, es %s.", sede_name, channel_id, type(channel).__name__)
                 continue
 
+            logger.info("[Exámenes] Canal de %s resuelto: #%s (ID: %d)", sede_name, channel.name, channel.id)
+
             # Clear previous bot messages in the channel
+            deleted_count = 0
             async for msg in channel.history(limit=50):
                 if msg.author == self.user:
                     try:
                         await msg.delete()
-                    except discord.HTTPException:
-                        pass
+                        deleted_count += 1
+                    except discord.HTTPException as exc:
+                        logger.warning("[Exámenes] No se pudo borrar mensaje %s en #%s: %s", msg.id, channel.name, exc)
+            logger.info("[Exámenes] Borrados %d mensajes previos del bot en #%s.", deleted_count, channel.name)
 
             # Build and send embeds
             exams_data = grouped.get(sede_name, {"abierta": [], "proxima": []})
             embeds = build_examenes_embeds(self.config, sede_name, exams_data)
 
-            for embed in embeds:
-                await channel.send(embed=embed)
+            logger.info("[Exámenes] Enviando %d embed(s) a #%s...", len(embeds), channel.name)
+            for idx, embed in enumerate(embeds):
+                try:
+                    await channel.send(embed=embed)
+                    logger.info("[Exámenes] Embed %d/%d enviado a #%s.", idx + 1, len(embeds), channel.name)
+                except discord.HTTPException as exc:
+                    logger.error("[Exámenes] ERROR al enviar embed %d/%d a #%s: %s", idx + 1, len(embeds), channel.name, exc)
 
             total = len(exams_data.get("abierta", [])) + len(exams_data.get("proxima", []))
             logger.info(
-                "Enviados %d embed(s) con %d fecha(s) al canal de %s.",
-                len(embeds), total, sede_name,
+                "[Exámenes] ✅ Sede %s: %d embed(s) con %d fecha(s) enviados a #%s.",
+                sede_name, len(embeds), total, channel.name,
             )
 
-        logger.info("Actualización semanal de exámenes completada.")
+        logger.info("[Exámenes] === FIN de post_examenes_update ===")
 
     # -- Polling loop --
 
