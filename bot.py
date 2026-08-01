@@ -24,7 +24,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("codes-discord-bot")
 
-STUDENTS_FILE = Path("data/students.json")
+BASE_DIR = Path(__file__).parent.resolve()
+
+
+def resolve_path(p: Path | str) -> Path:
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path
+    return BASE_DIR / path
+
+
+STUDENTS_FILE = resolve_path("data/students.json")
+
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +71,7 @@ class Config:
         if not token:
             raise ValueError("Falta DISCORD_TOKEN en variables de entorno (o archivo .env)")
 
-        config_path = Path("config.json")
+        config_path = resolve_path("config.json")
         if not config_path.exists():
             raise FileNotFoundError("Falta config.json. Copia config.example.json a config.json y completalo.")
 
@@ -108,9 +121,9 @@ class Config:
             request_timeout_seconds=max(5, int(data.get("REQUEST_TIMEOUT_SECONDS", 20))),
             poll_interval_hours=max(0.1, float(data.get("POLL_INTERVAL_HOURS", 12.0))),
             send_on_start=bool(data.get("SEND_ON_START", False)),
-            state_file=Path(data.get("STATE_FILE", "bot_state.json")),
+            state_file=resolve_path(data.get("STATE_FILE", "bot_state.json")),
             embed_color_hex=str(data.get("EMBED_COLOR_HEX", "#1F8B4C")).strip(),
-            examenes_planes_file=Path(data.get("EXAMENES_PLANES_FILE", "planes_estudio.json")),
+            examenes_planes_file=resolve_path(data.get("EXAMENES_PLANES_FILE", "planes_estudio.json")),
         )
 
 
@@ -228,14 +241,15 @@ def load_planes_codigos(planes_file: Path) -> dict[str, list[str]]:
 
     Returns a dict mapping subject code to the list of plans it belongs to.
     """
-    if not planes_file.exists():
-        logger.warning("No se encontró %s. No se consultarán exámenes.", planes_file)
+    resolved_file = resolve_path(planes_file)
+    if not resolved_file.exists():
+        logger.warning("[Exámenes] No se encontró %s (buscado en %s). No se consultarán exámenes.", planes_file, resolved_file)
         return {}
 
     try:
-        data = json.loads(planes_file.read_text(encoding="utf-8"))
+        data = json.loads(resolved_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        logger.error("Error al leer %s: %s", planes_file, exc)
+        logger.error("[Exámenes] Error al leer %s: %s", resolved_file, exc)
         return {}
 
     codigos: dict[str, list[str]] = {}
