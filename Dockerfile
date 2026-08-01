@@ -11,9 +11,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar el código del bot y la configuración
+# Copiar el código del bot, configuración y plan de estudios
 COPY bot.py .
 COPY config.json .
+COPY planes_estudio.json .
 
 # Comando para ejecutar el bot
 CMD ["python", "bot.py"]
